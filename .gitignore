@@ -1,0 +1,23 @@
+# Raw videos
+data/raw_videos/
+
+# Testing videos 
+test_videos/
+
+# Python virtual environment
+venv/
+
+# macOS system files
+.DS_Store
+
+# Temporary files
+*.tmp
+*.log
+
+# Pycache
+__pycache__/
+*.pyc
+
+# IDE files
+.vscode/
+.idea/
