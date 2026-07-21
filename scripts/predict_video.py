@@ -133,14 +133,18 @@ def predict_video(video_path):
             return pickle.load(f)
     print("Loading models...")
     move_clf = _load('move_classifier.pkl')
-    quality_clf = _load('quality_classifier.pkl')
     iso_forests = {}
+    quality_clfs = {}  # per-move quality classifiers
     for m in MOVE_NAMES:
         fn = f'isolation_forest_{m}.pkl'
         if os.path.exists(os.path.join(base_dir, 'models', fn)):
             iso_forests[m] = _load(fn)
             print(f"  ✓ {fn}")
-    print(f"  ✓ move_classifier.pkl\n  ✓ quality_classifier.pkl\n")
+        qfn = f'quality_{m}.pkl'
+        if os.path.exists(os.path.join(base_dir, 'models', qfn)):
+            quality_clfs[m] = _load(qfn)
+            print(f"  ✓ {qfn}")
+    print(f"  ✓ move_classifier.pkl\n")
 
     # ---- Process video — collect per-frame params --------------------
     video_name = os.path.basename(video_path)
@@ -187,25 +191,42 @@ def predict_video(video_path):
 
     # ---- Predict -----------------------------------------------------
     move_pred = move_clf.predict(X)[0]; mpb = move_clf.predict_proba(X)[0]
-    quality_pred = quality_clf.predict(X)[0]; qpb = quality_clf.predict_proba(X)[0]
+
+    # Use the per-move quality classifier for the predicted move
+    quality_pred = 'Unknown'
+    qpb = np.array([0.5, 0.5])  # default: uncertain
+    if move_pred in quality_clfs:
+        quality_pred = quality_clfs[move_pred].predict(X)[0]
+        qpb = quality_clfs[move_pred].predict_proba(X)[0]
+    else:
+        print(f"  ⚠️  No per-move quality classifier for {move_pred}")
     outlier = False
     if move_pred in iso_forests:
-        outlier = iso_forests[move_pred].predict(X)[0] == -1
+        try:
+            outlier = iso_forests[move_pred].predict(X)[0] == -1
+        except ValueError:
+            # Isolation Forest has wrong number of features (likely old model)
+            print(f"  ⚠️  Skipping isolation_forest_{move_pred}.pkl —"
+                  f" incompatible feature count")
+            outlier = False
 
     # ---- Output ------------------------------------------------------
-    mi = np.argmax(mpb); qi = np.argmax(qpb)
+    mi = np.argmax(mpb)
+    qi = np.argmax(qpb)
+    q_classes = quality_clfs[move_pred].classes_ if move_pred in quality_clfs else ['Normal', 'Bad']
     print("=" * 60)
     print(f"RESULTS: {video_name}")
     print("=" * 60)
     print(f"\n  PREDICTED MOVE:     {move_pred}  (confidence: {max(mpb):.1%})")
-    print(f"  PREDICTED QUALITY:  {quality_pred}  (confidence: {max(qpb):.1%})")
+    print(f"  PREDICTED QUALITY:  {quality_pred}  (confidence: {max(qpb):.1%})"
+          + (f"  [using quality_{move_pred}.pkl]" if move_pred in quality_clfs else ""))
     print(f"  ISOLATION FOREST:   {'⚠️  OUTLIER' if outlier else '✓  normal'}")
     print("\n  Move probabilities:")
     for i, n in enumerate(move_clf.classes_):
         b = '█'*int(mpb[i]*40)+'░'*(40-int(mpb[i]*40))
         print(f"    {n:12s}  {mpb[i]:.1%}  {b}{' ←' if i==mi else ''}")
     print("\n  Quality probabilities:")
-    for i, n in enumerate(quality_clf.classes_):
+    for i, n in enumerate(q_classes):
         b = '█'*int(qpb[i]*40)+'░'*(40-int(qpb[i]*40))
         print(f"    {n:12s}  {qpb[i]:.1%}  {b}{' ←' if i==qi else ''}")
     print(f"\n{'='*60}")

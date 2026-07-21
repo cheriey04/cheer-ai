@@ -22,6 +22,7 @@ Uses all columns derived from the 5 biomechanical parameters.
 """
 
 import os
+import json
 import pickle
 import warnings
 from pathlib import Path
@@ -198,6 +199,12 @@ def main():
 
         if len(X_normal) < 3:
             print(f"  {move:12s}  only {len(X_normal)} Normal videos — skipping")
+            # Rename any old per-frame model so it doesn't conflict
+            old = os.path.join(MODEL_DIR, f'isolation_forest_{move}.pkl')
+            legacy = os.path.join(MODEL_DIR, f'isolation_forest_{move}_legacy_perframe.pkl')
+            if os.path.exists(old):
+                os.rename(old, legacy)
+                print(f"    (renamed old 5-feature model → {legacy})")
             continue
 
         iso_forest = IsolationForest(
@@ -255,6 +262,82 @@ def main():
     save_model(quality_clf, 'quality_classifier.pkl')
     print()
 
+    # =====================================================================
+    # MODEL 4 — Per-Move Quality Classifiers
+    # =====================================================================
+    print("=" * 60)
+    print("MODEL 4: PER-MOVE QUALITY CLASSIFIERS")
+    print("=" * 60)
+    print("  Trains a separate Normal-vs-Bad classifier for each move.")
+    print("  Also saves Normal averages for error localization.")
+    print()
+
+    normal_averages = {}  # {move_name: {feature: mean_value}}
+
+    for move in MOVE_NAMES:
+        mask = df['move_name'] == move
+        df_move = df[mask]
+        n_videos = len(df_move)
+        n_normal = (df_move['severity_label'] == 'Normal').sum()
+        n_bad = (df_move['severity_label'] == 'Bad').sum()
+
+        print(f"  {move:12s}  videos: {n_videos}  (Normal: {n_normal}, Bad: {n_bad})")
+
+        if n_normal < 2 or n_bad < 2:
+            print(f"    ⚠️  Need ≥2 Normal AND ≥2 Bad — skipping\n")
+            continue
+
+        X_move = df_move[feature_cols].to_numpy()
+        y_move_sev = df_move['severity_label'].to_numpy()
+
+        # Cross-validation (use fewer folds if not enough samples)
+        folds_for_move = min(N_FOLDS, n_videos // 2, n_normal, n_bad)
+        folds_for_move = max(2, folds_for_move)
+
+        try:
+            accs, y_trues, y_preds = cross_validate_rf(
+                X_move, y_move_sev, folds_for_move
+            )
+        except ValueError:
+            print(f"    ⚠️  Not enough data for cross-validation — skipping\n")
+            continue
+
+        print(f"    CV folds: {folds_for_move}")
+        print(f"    Per-fold accuracies: {[f'{a:.4f}' for a in accs]}")
+        print(f"    Mean accuracy:        {np.mean(accs):.4f} "
+              f"({np.mean(accs) * 100:.2f}%)")
+        print(f"    Std deviation:        {np.std(accs):.4f}")
+
+        # Classification report (all folds)
+        yt = np.concatenate(y_trues)
+        yp = np.concatenate(y_preds)
+        print(f"\n    Classification Report:")
+        cr = classification_report(yt, yp, zero_division=0)
+        for line in cr.split('\n'):
+            if line.strip():
+                print(f"    {line}")
+
+        # Train final per-move model on ALL data for this move
+        clf = RandomForestClassifier(
+            n_estimators=200, random_state=42, n_jobs=-1,
+        )
+        clf.fit(X_move, y_move_sev)
+        save_model(clf, f'quality_{move}.pkl')
+
+        # Compute Normal averages (for error localization feedback)
+        mask_normal = df_move['severity_label'] == 'Normal'
+        means = df_move.loc[mask_normal, feature_cols].mean().to_dict()
+        normal_averages[move] = {k: round(v, 6) for k, v in means.items()}
+        print()
+
+    # Save Normal averages to JSON
+    if normal_averages:
+        avg_path = os.path.join(MODEL_DIR, 'normal_averages.json')
+        with open(avg_path, 'w') as f:
+            json.dump(normal_averages, f, indent=2)
+        print(f"  Saved Normal averages → {avg_path}")
+    print()
+
     # ---- Final summary --------------------------------------------------
     print("=" * 60)
     print("ALL MODELS TRAINED (5-fold CV)")
@@ -265,10 +348,13 @@ def main():
     print()
     print(f"  models/move_classifier.pkl")
     for move in MOVE_NAMES:
-        path = os.path.join(MODEL_DIR, f'isolation_forest_{move}.pkl')
-        if os.path.exists(path):
-            print(f"  models/isolation_forest_{move}.pkl")
-    print(f"  models/quality_classifier.pkl")
+        for prefix in ['isolation_forest', 'quality']:
+            path = os.path.join(MODEL_DIR, f'{prefix}_{move}.pkl')
+            if os.path.exists(path):
+                print(f"  models/{prefix}_{move}.pkl")
+    print(f"  models/quality_classifier.pkl  (global, kept for compatibility)")
+    if normal_averages:
+        print(f"  models/normal_averages.json")
     print()
 
 
