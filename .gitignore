@@ -27,4 +27,4 @@ __pycache__/
 
 # IDE files
 .vscode/
-.idea/
+.idea/output_frames/
