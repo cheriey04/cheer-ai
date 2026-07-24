@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cheer AI — Form Analysis</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+               background: #0f172a; color: #e2e8f0; min-height: 100vh;
+               display: flex; justify-content: center; align-items: center; }
+        .container { max-width: 720px; width: 100%; padding: 2rem; }
+
+        h1 { font-size: 2rem; text-align: center; margin-bottom: 0.25rem; }
+        .subtitle { text-align: center; color: #94a3b8; margin-bottom: 2rem; }
+
+        /* Upload box */
+        #drop-zone { border: 2px dashed #334155; border-radius: 12px; padding: 3rem 2rem;
+                     text-align: center; cursor: pointer; transition: border-color .2s; }
+        #drop-zone:hover, #drop-zone.dragover { border-color: #38bdf8; }
+        #drop-zone p { color: #94a3b8; }
+        #drop-zone .icon { font-size: 3rem; margin-bottom: 0.5rem; }
+        #file-name { margin-top: 0.75rem; color: #38bdf8; font-weight: 600; }
+        input[type=file] { display: none; }
+
+        /* Button */
+        button { display: block; width: 100%; margin-top: 1rem; padding: 0.85rem;
+                 background: #2563eb; color: #fff; border: none; border-radius: 8px;
+                 font-size: 1.1rem; font-weight: 600; cursor: pointer;
+                 transition: background .2s; }
+        button:hover { background: #1d4ed8; }
+        button:disabled { background: #475569; cursor: not-allowed; }
+
+        /* Spinner */
+        .spinner { display: none; text-align: center; margin: 1.5rem 0; }
+        .spinner.active { display: block; }
+        .spinner::after { content: ''; display: inline-block; width: 32px; height: 32px;
+                          border: 3px solid #334155; border-top-color: #38bdf8;
+                          border-radius: 50%; animation: spin .7s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* Results */
+        #results { display: none; margin-top: 2rem; }
+        #results.active { display: block; }
+
+        .card { background: #1e293b; border-radius: 10px; padding: 1.25rem;
+                margin-bottom: 1rem; }
+        .card h3 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em;
+                   color: #64748b; margin-bottom: 0.5rem; }
+
+        .verdict { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+        .verdict-item { flex: 1; min-width: 150px; }
+        .verdict-label { font-size: 0.75rem; color: #64748b; }
+        .verdict-value { font-size: 1.4rem; font-weight: 700; }
+        .verdict-conf { font-size: 0.8rem; color: #94a3b8; }
+
+        .score-circle { width: 80px; height: 80px; border-radius: 50%;
+                        display: flex; align-items: center; justify-content: center;
+                        font-size: 1.6rem; font-weight: 800;
+                        border: 4px solid; margin: 0 auto; }
+        .score-good { border-color: #22c55e; color: #22c55e; }
+        .score-ok { border-color: #eab308; color: #eab308; }
+        .score-bad { border-color: #ef4444; color: #ef4444; }
+
+        .bar-wrap { margin: 0.35rem 0; display: flex; align-items: center; gap: 0.5rem; }
+        .bar-label { width: 80px; font-size: 0.85rem; text-align: right; }
+        .bar-track { flex: 1; height: 18px; background: #0f172a; border-radius: 4px;
+                     overflow: hidden; }
+        .bar-fill { height: 100%; border-radius: 4px; transition: width .4s; }
+        .bar-pct { width: 55px; font-size: 0.8rem; color: #94a3b8; }
+
+        .dev-table { width: 100%; font-size: 0.85rem; border-collapse: collapse; }
+        .dev-table th { text-align: left; color: #64748b; padding: 0.4rem 0.5rem;
+                        border-bottom: 1px solid #334155; }
+        .dev-table td { padding: 0.45rem 0.5rem; border-bottom: 1px solid #1e293b; }
+        .dev-table .z-high { color: #ef4444; font-weight: 700; }
+        .dev-table .z-mid { color: #eab308; font-weight: 700; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>📣 Cheer AI</h1>
+    <p class="subtitle">Upload a cheerleading video for instant form analysis</p>
+
+    <!-- Upload -->
+    <div id="drop-zone" onclick="document.getElementById('file-input').click()">
+        <div class="icon">🎥</div>
+        <p>Click or drag an .mp4 video here</p>
+        <div id="file-name"></div>
+    </div>
+    <input type="file" id="file-input" accept=".mp4">
+    <button id="analyze-btn" onclick="analyze()">Analyze</button>
+
+    <!-- Spinner -->
+    <div class="spinner" id="spinner"></div>
+
+    <!-- Results -->
+    <div id="results">
+        <!-- Verdict -->
+        <div class="card">
+            <h3>Verdict</h3>
+            <div class="verdict">
+                <div class="verdict-item">
+                    <div class="verdict-label">Predicted Move</div>
+                    <div class="verdict-value" id="res-move">—</div>
+                    <div class="verdict-conf" id="res-move-conf"></div>
+                </div>
+                <div class="verdict-item">
+                    <div class="verdict-label">Quality</div>
+                    <div class="verdict-value" id="res-quality">—</div>
+                    <div class="verdict-conf" id="res-quality-conf"></div>
+                </div>
+                <div class="verdict-item" style="text-align:center">
+                    <div class="verdict-label">Score</div>
+                    <div class="score-circle" id="res-score-circle">—</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Move Probabilities -->
+        <div class="card">
+            <h3>Move Probabilities</h3>
+            <div id="res-move-bars"></div>
+        </div>
+
+        <!-- Quality Probabilities -->
+        <div class="card">
+            <h3>Quality Probabilities</h3>
+            <div id="res-quality-bars"></div>
+        </div>
+
+        <!-- Top Deviations -->
+        <div class="card">
+            <h3>Top Deviations from Normal</h3>
+            <table class="dev-table">
+                <thead><tr><th>Feature</th><th>Your Value</th><th>Normal Range</th><th>Z</th></tr></thead>
+                <tbody id="res-deviations"></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<script>
+// ── Drag & drop ──────────────────────────────────────────────────────────
+const dropZone = document.getElementById('drop-zone');
+const fileInput = document.getElementById('file-input');
+const fileName = document.getElementById('file-name');
+const btn = document.getElementById('analyze-btn');
+
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+dropZone.addEventListener('drop', e => {
+    e.preventDefault();
+    dropZone.classList.remove('dragover');
+    if (e.dataTransfer.files.length) {
+        fileInput.files = e.dataTransfer.files;
+        fileName.textContent = e.dataTransfer.files[0].name;
+    }
+});
+fileInput.addEventListener('change', () => {
+    if (fileInput.files.length) fileName.textContent = fileInput.files[0].name;
+});
+
+// ── Analyze ──────────────────────────────────────────────────────────────
+async function analyze() {
+    if (!fileInput.files.length) {
+        alert('Please select a video first.');
+        return;
+    }
+
+    const video = fileInput.files[0];
+    if (!video.name.toLowerCase().endsWith('.mp4')) {
+        alert('Only .mp4 files are supported.');
+        return;
+    }
+
+    // Show spinner, hide old results
+    document.getElementById('results').classList.remove('active');
+    document.getElementById('spinner').classList.add('active');
+    btn.disabled = true;
+    btn.textContent = 'Analyzing...';
+
+    const formData = new FormData();
+    formData.append('video', video);
+
+    try {
+        const resp = await fetch('/predict', { method: 'POST', body: formData });
+        if (!resp.ok) {
+            const err = await resp.json();
+            throw new Error(err.error || 'Unknown error');
+        }
+        const data = await resp.json();
+        renderResults(data);
+    } catch (err) {
+        alert('Error: ' + err.message);
+    } finally {
+        document.getElementById('spinner').classList.remove('active');
+        btn.disabled = false;
+        btn.textContent = 'Analyze';
+    }
+}
+
+// ── Render ───────────────────────────────────────────────────────────────
+function renderResults(d) {
+    document.getElementById('results').classList.add('active');
+
+    // Verdict
+    document.getElementById('res-move').textContent = d.predicted_move;
+    document.getElementById('res-move-conf').textContent =
+        `confidence: ${(d.predicted_move_confidence * 100).toFixed(1)}%`;
+    document.getElementById('res-quality').textContent = d.predicted_quality;
+    document.getElementById('res-quality-conf').textContent =
+        `confidence: ${(d.predicted_quality_confidence * 100).toFixed(1)}%`;
+
+    // Score circle
+    const circle = document.getElementById('res-score-circle');
+    circle.textContent = d.quality_score;
+    circle.className = 'score-circle ' + (
+        d.quality_score >= 70 ? 'score-good' : d.quality_score >= 40 ? 'score-ok' : 'score-bad'
+    );
+
+    // Move probability bars
+    const moveBars = document.getElementById('res-move-bars');
+    moveBars.innerHTML = '';
+    for (const [name, prob] of Object.entries(d.move_probabilities)) {
+        moveBars.innerHTML += barHTML(name, prob, name === d.predicted_move ? '#38bdf8' : '#475569');
+    }
+
+    // Quality probability bars
+    const qualBars = document.getElementById('res-quality-bars');
+    qualBars.innerHTML = '';
+    for (const [name, prob] of Object.entries(d.quality_probabilities)) {
+        qualBars.innerHTML += barHTML(name, prob, name === d.predicted_quality ? '#38bdf8' : '#475569');
+    }
+
+    // Deviations table
+    const devTable = document.getElementById('res-deviations');
+    devTable.innerHTML = '';
+    const devs = d.top_deviations_detail || [];
+    for (const dev of devs) {
+        const zClass = dev.z_score >= 3 ? 'z-high' : dev.z_score >= 2 ? 'z-mid' : '';
+        devTable.innerHTML += `
+            <tr>
+                <td>${dev.feature}</td>
+                <td>${dev.value.toFixed(2)}</td>
+                <td>${dev.normal_mean.toFixed(2)} ± ${dev.normal_std.toFixed(2)}</td>
+                <td class="${zClass}">${dev.z_score.toFixed(1)}σ</td>
+            </tr>`;
+    }
+
+    window.scrollTo({ top: document.getElementById('results').offsetTop - 20, behavior: 'smooth' });
+}
+
+function barHTML(label, prob, color) {
+    return `<div class="bar-wrap">
+        <span class="bar-label">${label}</span>
+        <div class="bar-track"><div class="bar-fill" style="width:${(prob*100).toFixed(0)}%;background:${color}"></div></div>
+        <span class="bar-pct">${(prob*100).toFixed(1)}%</span>
+    </div>`;
+}
+</script>
+</body>
+</html>
