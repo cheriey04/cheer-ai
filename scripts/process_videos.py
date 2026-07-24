@@ -24,6 +24,7 @@ import json
 import math
 import ssl
 import urllib.request
+from collections import namedtuple
 from pathlib import Path
 
 # Third-party packages
@@ -59,6 +60,11 @@ RIGHT_KNEE = 26
 LEFT_ANKLE = 27
 RIGHT_ANKLE = 28
 
+# Lightweight container for pixel-space landmark coordinates.
+# Used to avoid aspect-ratio distortion when computing angles from
+# normalized coords (x,y both in [0,1] but image may not be square).
+PixelLandmark = namedtuple('PixelLandmark', ['x', 'y'])
+
 # ---- Configuration ----
 
 # Supported video file extensions
@@ -75,23 +81,23 @@ POSE_MODEL_URL = (
 # ---------------------------------------------------------------------------
 
 def _vec(a, b):
-    """Return 3D vector from landmark a to landmark b.
+    """Return 2D vector from landmark a to landmark b.
 
     Both a and b are MediaPipe NormalizedLandmark objects with .x, .y, .z.
-    The resulting vector uses ALL three coordinates (X, Y, Z).
+    Uses only X and Y (screen-plane) — Z is ignored to avoid depth distortion.
     """
-    return np.array([b.x - a.x, b.y - a.y, b.z - a.z])
+    return np.array([b.x - a.x, b.y - a.y])
 
 
 def _norm(v):
-    """Euclidean norm (magnitude) of a 3D vector."""
+    """Euclidean norm (magnitude) of a 2D vector."""
     return float(np.linalg.norm(v))
 
 
 def _angle_between(v1, v2):
-    """Angle in degrees between two 3D vectors (0—180).
+    """Angle in degrees between two 2D vectors (0—180).
 
-    Uses the 3D dot-product formula:
+    Uses the 2D dot-product formula:
         cos(theta) = (v1 · v2) / (|v1| * |v2|)
 
     Returns 0 if either vector has near-zero magnitude (degenerate case).
@@ -107,13 +113,13 @@ def _angle_between(v1, v2):
 
 def _tilt_from_horizontal(vec):
     """
-    Angle (0–90 deg) between `vec` and the horizontal axis (1, 0, 0).
+    Angle (0–90 deg) between `vec` and the horizontal axis (1, 0).
 
     Takes min(angle, 180-angle) so a vector pointing down-left (e.g. 150 deg)
     is treated the same as 30 deg — both are 30 deg away from level.
     0 deg = perfectly horizontal / level.
     """
-    horizontal = np.array([1.0, 0.0, 0.0])
+    horizontal = np.array([1.0, 0.0])
     raw = _angle_between(vec, horizontal)     # 0–180 deg
     return min(raw, 180.0 - raw)              # Fold into 0–90
 
@@ -141,51 +147,57 @@ def calc_pelvic_tilt(lm):
 
 
 def calc_trunk_shift(lm):
-    """Parameter 3: Trunk Shift (0–180 deg).  0 = vertical torso.
+    """Parameter 3: Trunk Shift (0–90 deg).  0 = perfectly upright.
 
-    Step 1: Compute the 3D midpoint of both shoulders and both hips.
-    Step 2: Trunk vector = shoulder_midpoint - hip_midpoint.
-    Step 3: Measure the 3D angle between the trunk vector and vertical (0,1,0).
+    Step 1: Compute the 2D midpoint of both shoulders and both hips.
+    Step 2: Trunk vector = shoulder_midpoint - hip_midpoint (points upward).
+    Step 3: Measure the 2D angle between the trunk vector and upward-vertical (0,-1).
     """
-    # Midpoint of left & right shoulders (X, Y, Z)
+    # Midpoint of left & right shoulders (X, Y)
     shoulder_mid = np.array([
         (lm[LEFT_SHOULDER].x + lm[RIGHT_SHOULDER].x) / 2,
         (lm[LEFT_SHOULDER].y + lm[RIGHT_SHOULDER].y) / 2,
-        (lm[LEFT_SHOULDER].z + lm[RIGHT_SHOULDER].z) / 2,
     ])
-    # Midpoint of left & right hips (X, Y, Z)
+    # Midpoint of left & right hips (X, Y)
     hip_mid = np.array([
         (lm[LEFT_HIP].x + lm[RIGHT_HIP].x) / 2,
         (lm[LEFT_HIP].y + lm[RIGHT_HIP].y) / 2,
-        (lm[LEFT_HIP].z + lm[RIGHT_HIP].z) / 2,
     ])
-    trunk = shoulder_mid - hip_mid          # Vector from hips → shoulders
-    vertical = np.array([0.0, 1.0, 0.0])    # Y-axis = up in MediaPipe
-    return _angle_between(trunk, vertical)
+    trunk = shoulder_mid - hip_mid          # Vector from hips → shoulders (points up)
+    upward = np.array([0.0, -1.0])           # Screen coords: -Y = upward
+    return _angle_between(trunk, upward)     # 0° = upright, ~90° = horizontal
+
+
+def calc_left_knee_curvature(lm):
+    """Left Knee Curvature — athlete's left leg (0–180 deg).  180 = fully straight.
+
+    Athlete facing camera: their left = camera's right = MediaPipe RIGHT landmarks.
+    Uses MediaPipe RIGHT_HIP(24) → RIGHT_KNEE(26) → RIGHT_ANKLE(28).
+    Computes the bend angle and inverts so 180° = straight, 0° = fully bent.
+    """
+    bend = _angle_between(
+        _vec(lm[RIGHT_HIP], lm[RIGHT_KNEE]),
+        _vec(lm[RIGHT_KNEE], lm[RIGHT_ANKLE]),
+    )
+    return 180.0 - bend
+
+
+def calc_right_knee_curvature(lm):
+    """Right Knee Curvature — athlete's right leg (0–180 deg).  180 = fully straight.
+
+    Athlete facing camera: their right = camera's left = MediaPipe LEFT landmarks.
+    Uses MediaPipe LEFT_HIP(23) → LEFT_KNEE(25) → LEFT_ANKLE(27).
+    """
+    bend = _angle_between(
+        _vec(lm[LEFT_HIP], lm[LEFT_KNEE]),
+        _vec(lm[LEFT_KNEE], lm[LEFT_ANKLE]),
+    )
+    return 180.0 - bend
 
 
 def calc_knee_curvature(lm):
-    """Parameter 4: Knee Curvature (0–180 deg).  180 = straight legs.
-
-    For each leg, computes the 3D angle at the knee joint:
-        - Thigh vector:  hip → knee
-        - Shin vector:   knee → ankle
-        - Knee angle = angle_between(thigh, shin)
-
-    Final output is the average of left and right knee angles.
-    """
-    # Left leg: angle at left knee (25) between hip→knee and knee→ankle
-    left_angle = _angle_between(
-        _vec(lm[LEFT_HIP], lm[LEFT_KNEE]),    # Thigh: LH → LK
-        _vec(lm[LEFT_KNEE], lm[LEFT_ANKLE]),  # Shin:  LK → LA
-    )
-    # Right leg: angle at right knee (26) between hip→knee and knee→ankle
-    right_angle = _angle_between(
-        _vec(lm[RIGHT_HIP], lm[RIGHT_KNEE]),    # Thigh: RH → RK
-        _vec(lm[RIGHT_KNEE], lm[RIGHT_ANKLE]),  # Shin:  RK → RA
-    )
-    # Average both legs for a single symmetry metric
-    return (left_angle + right_angle) / 2.0
+    """Combined Knee Curvature — average of left and right (0–180 deg).  180 = straight legs."""
+    return (calc_left_knee_curvature(lm) + calc_right_knee_curvature(lm)) / 2.0
 
 
 def calc_arm_misalignment(lm):
@@ -203,6 +215,63 @@ def calc_arm_misalignment(lm):
     elbow_angle = _tilt_from_horizontal(_vec(lm[LEFT_ELBOW], lm[RIGHT_ELBOW]))
     # Average for a single arm-level metric
     return (wrist_angle + elbow_angle) / 2.0
+
+
+def calc_distance_between_feet(lm):
+    """Distance Between Feet — magnitude of vector between left and right ankles.
+
+    Uses MediaPipe LEFT_ANKLE(27) and RIGHT_ANKLE(28).
+    Returns normalized Euclidean distance (0+).
+    """
+    return _norm(_vec(lm[LEFT_ANKLE], lm[RIGHT_ANKLE]))
+
+
+def calc_left_arm_curvature(lm):
+    """Left Arm Curvature — athlete's left arm (0–180 deg).  180 = fully straight.
+
+    Athlete facing camera: their left = camera's right = MediaPipe RIGHT landmarks.
+    Angle at elbow: wrist→elbow vs elbow→shoulder.
+    Uses MediaPipe RIGHT_WRIST(16) → RIGHT_ELBOW(14) → RIGHT_SHOULDER(12).
+    """
+    bend = _angle_between(
+        _vec(lm[RIGHT_WRIST], lm[RIGHT_ELBOW]),
+        _vec(lm[RIGHT_ELBOW], lm[RIGHT_SHOULDER]),
+    )
+    return 180.0 - bend
+
+
+def calc_right_arm_curvature(lm):
+    """Right Arm Curvature — athlete's right arm (0–180 deg).  180 = fully straight.
+
+    Athlete facing camera: their right = camera's left = MediaPipe LEFT landmarks.
+    Angle at elbow: wrist→elbow vs elbow→shoulder.
+    Uses MediaPipe LEFT_WRIST(15) → LEFT_ELBOW(13) → LEFT_SHOULDER(11).
+    """
+    bend = _angle_between(
+        _vec(lm[LEFT_WRIST], lm[LEFT_ELBOW]),
+        _vec(lm[LEFT_ELBOW], lm[LEFT_SHOULDER]),
+    )
+    return 180.0 - bend
+
+
+def calc_left_arm_angle(lm):
+    """Left Arm Angle — athlete's left upper arm vs horizontal (0–90 deg).  0 = level.
+
+    Athlete facing camera: their left = camera's right = MediaPipe RIGHT landmarks.
+    Vector from shoulder to elbow, measured against horizontal.
+    Uses MediaPipe RIGHT_SHOULDER(12) → RIGHT_ELBOW(14).
+    """
+    return _tilt_from_horizontal(_vec(lm[RIGHT_SHOULDER], lm[RIGHT_ELBOW]))
+
+
+def calc_right_arm_angle(lm):
+    """Right Arm Angle — athlete's right upper arm vs horizontal (0–90 deg).  0 = level.
+
+    Athlete facing camera: their right = camera's left = MediaPipe LEFT landmarks.
+    Vector from shoulder to elbow, measured against horizontal.
+    Uses MediaPipe LEFT_SHOULDER(11) → LEFT_ELBOW(13).
+    """
+    return _tilt_from_horizontal(_vec(lm[LEFT_SHOULDER], lm[LEFT_ELBOW]))
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +430,11 @@ def process_videos():
 
     # ---- Open both CSVs for writing (overwrite existing) ------------
     param_names = ['shoulder_tilt', 'pelvic_tilt', 'trunk_shift',
-                   'knee_curvature', 'arm_misalignment']
+                   'left_knee_curvature', 'right_knee_curvature',
+                   'knee_curvature', 'arm_misalignment',
+                   'distance_between_feet',
+                   'left_arm_curvature', 'right_arm_curvature',
+                   'left_arm_angle', 'right_arm_angle']
 
     # Per-frame CSV header
     frame_header = ['video_filename', 'move_name', 'severity_label',
@@ -415,6 +488,7 @@ def process_videos():
                     break            # End of video
 
                 frame_num += 1
+                h, w = frame.shape[:2]  # frame dimensions for aspect-ratio correction
 
                 # MediaPipe Tasks API: convert BGR → RGB, then wrap as mp.Image
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -434,15 +508,24 @@ def process_videos():
 
                 # 33 landmarks for the first (and only) detected person
                 lm = results.pose_landmarks[0]
+                # Denormalize to pixel coordinates to avoid aspect-ratio distortion
+                pixel_lm = [PixelLandmark(lm[i].x * w, lm[i].y * h) for i in range(33)]
 
                 # ---- Calculate all 5 parameters ----------------------
                 try:
-                    st = calc_shoulder_tilt(lm)       # Parameter 1
-                    pt = calc_pelvic_tilt(lm)          # Parameter 2
-                    ts = calc_trunk_shift(lm)          # Parameter 3
-                    kc = calc_knee_curvature(lm)       # Parameter 4
-                    am = calc_arm_misalignment(lm)     # Parameter 5
-                    lm_json = landmarks_to_json(lm)    # Raw landmarks backup
+                    st = calc_shoulder_tilt(pixel_lm)       # Parameter 1
+                    pt = calc_pelvic_tilt(pixel_lm)          # Parameter 2
+                    ts = calc_trunk_shift(pixel_lm)          # Parameter 3
+                    lk = calc_left_knee_curvature(pixel_lm)  # Parameter 4
+                    rk = calc_right_knee_curvature(pixel_lm) # Parameter 5
+                    kc = calc_knee_curvature(pixel_lm)       # Parameter 6
+                    am = calc_arm_misalignment(pixel_lm)     # Parameter 7
+                    df_ = calc_distance_between_feet(pixel_lm)  # Parameter 8
+                    la = calc_left_arm_curvature(pixel_lm)   # Parameter 9
+                    ra = calc_right_arm_curvature(pixel_lm)  # Parameter 10
+                    laa = calc_left_arm_angle(pixel_lm)      # Parameter 11
+                    raa = calc_right_arm_angle(pixel_lm)     # Parameter 12
+                    lm_json = landmarks_to_json(lm)    # Raw landmarks backup (normalized)
                 except Exception:
                     # Safety net — skip frame if math fails for any reason
                     local_skipped += 1
@@ -454,11 +537,18 @@ def process_videos():
                     move_name,
                     severity,
                     frame_num,
-                    round(st, 4),       # Shoulder tilt, 4 decimal places
+                    round(st, 4),       # Shoulder tilt
                     round(pt, 4),       # Pelvic tilt
                     round(ts, 4),       # Trunk shift
-                    round(kc, 4),       # Knee curvature
+                    round(lk, 4),       # Left knee curvature
+                    round(rk, 4),       # Right knee curvature
+                    round(kc, 4),       # Knee curvature (combined)
                     round(am, 4),       # Arm misalignment
+                    round(df_, 4),      # Distance between feet
+                    round(la, 4),       # Left arm curvature
+                    round(ra, 4),       # Right arm curvature
+                    round(laa, 4),      # Left arm angle
+                    round(raa, 4),      # Right arm angle
                     lm_json,            # Full 33-landmark JSON string
                 ])
                 local_written += 1
@@ -467,8 +557,15 @@ def process_videos():
                 param_values['shoulder_tilt'].append(st)
                 param_values['pelvic_tilt'].append(pt)
                 param_values['trunk_shift'].append(ts)
+                param_values['left_knee_curvature'].append(lk)
+                param_values['right_knee_curvature'].append(rk)
                 param_values['knee_curvature'].append(kc)
                 param_values['arm_misalignment'].append(am)
+                param_values['distance_between_feet'].append(df_)
+                param_values['left_arm_curvature'].append(la)
+                param_values['right_arm_curvature'].append(ra)
+                param_values['left_arm_angle'].append(laa)
+                param_values['right_arm_angle'].append(raa)
 
             # Release video file handle
             cap.release()

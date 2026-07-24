@@ -13,9 +13,10 @@ using 5-fold cross-validation:
                              Flags outlier videos that may indicate bad form.
                              → models/isolation_forest_[move_name].pkl
 
-  3. Quality Classifier    — Random Forest that predicts severity_label
-                             (Normal vs Bad) from the aggregated stats.
-                             → models/quality_classifier.pkl
+  3. Per-Move Quality      — One Random Forest per move, predicts Normal vs Bad.
+                             Uses feature selection (5 or 7 params) and
+                             complexity control based on sample size.
+                             → models/quality_[move_name].pkl
 
 Uses training_data_aggregated.csv (one row per video).
 Uses all columns derived from the 5 biomechanical parameters.
@@ -224,53 +225,23 @@ def main():
     print()
 
     # =====================================================================
-    # MODEL 3 — Quality Classifier (5-fold CV)
+    # MODEL 3 — Per-Move Quality Classifiers
     # =====================================================================
     print("=" * 60)
-    print("MODEL 3: QUALITY CLASSIFIER — 5-Fold Cross-Validation")
-    print("=" * 60)
-
-    quality_labels = sorted(set(y_severity))
-    accs, y_trues, y_preds = cross_validate_rf(X, y_severity, N_FOLDS)
-
-    print(f"  Per-fold accuracies: {[f'{a:.4f}' for a in accs]}")
-    print(f"  Mean accuracy:        {np.mean(accs):.4f} "
-          f"({np.mean(accs) * 100:.2f}%)")
-    print(f"  Std deviation:        {np.std(accs):.4f}")
-
-    print_confusion_matrix(y_trues[-1], y_preds[-1], quality_labels,
-                           title=f"Fold {len(accs)}")
-
-    print()
-    print("  Classification Report (all folds):")
-    y_true_all = np.concatenate(y_trues)
-    y_pred_all = np.concatenate(y_preds)
-    print(classification_report(y_true_all, y_pred_all, zero_division=0))
-
-    # Train final model on ALL data
-    quality_clf = RandomForestClassifier(
-        n_estimators=200, random_state=42, n_jobs=-1,
-    )
-    quality_clf.fit(X, y_severity)
-
-    print("  Top 10 feature importances (final model):")
-    imps = sorted(zip(feature_cols, quality_clf.feature_importances_),
-                  key=lambda x: x[1], reverse=True)
-    for name, imp in imps[:10]:
-        print(f"    {name:35s} importance = {imp:.4f}")
-
-    save_model(quality_clf, 'quality_classifier.pkl')
-    print()
-
-    # =====================================================================
-    # MODEL 4 — Per-Move Quality Classifiers
-    # =====================================================================
-    print("=" * 60)
-    print("MODEL 4: PER-MOVE QUALITY CLASSIFIERS")
+    print("MODEL 3: PER-MOVE QUALITY CLASSIFIERS")
     print("=" * 60)
     print("  Trains a separate Normal-vs-Bad classifier for each move.")
+    print("  Uses feature selection + complexity control per move.")
     print("  Also saves Normal averages for error localization.")
     print()
+
+    # Core 5 params (40 features) — used for data-starved moves
+    CORE_PARAMS = {'shoulder_tilt', 'pelvic_tilt', 'trunk_shift',
+                   'knee_curvature', 'arm_misalignment'}
+    core_feature_cols = [c for c in feature_cols
+                         if c.split('_')[0] in CORE_PARAMS
+                         or c.split('_')[0] + '_' + c.split('_')[1] in CORE_PARAMS
+                         or any(c.startswith(p + '_') for p in CORE_PARAMS)]
 
     normal_averages = {}  # {move_name: {feature: mean_value}}
 
@@ -281,16 +252,29 @@ def main():
         n_normal = (df_move['severity_label'] == 'Normal').sum()
         n_bad = (df_move['severity_label'] == 'Bad').sum()
 
+        # All moves use all features (56 → 96 with new params)
+        move_feature_cols = feature_cols
+        n_feats = len(move_feature_cols)
+
+        # Complexity control: fewer trees + depth limit for small datasets
+        use_light_model = n_videos < 15
+        n_est = 100 if use_light_model else 200
+        max_d = 10 if use_light_model else None
+
+        print(f"  {move:12s}  videos: {n_videos} (Normal: {n_normal}, Bad: {n_bad})"
+              f"  |  {n_feats} features"
+              f"  |  {'light' if use_light_model else 'full'} model")
+
         print(f"  {move:12s}  videos: {n_videos}  (Normal: {n_normal}, Bad: {n_bad})")
 
         if n_normal < 2 or n_bad < 2:
             print(f"    ⚠️  Need ≥2 Normal AND ≥2 Bad — skipping\n")
             continue
 
-        X_move = df_move[feature_cols].to_numpy()
+        X_move = df_move[move_feature_cols].to_numpy()
         y_move_sev = df_move['severity_label'].to_numpy()
 
-        # Cross-validation (use fewer folds if not enough samples)
+        # Cross-validation
         folds_for_move = min(N_FOLDS, n_videos // 2, n_normal, n_bad)
         folds_for_move = max(2, folds_for_move)
 
@@ -308,7 +292,6 @@ def main():
               f"({np.mean(accs) * 100:.2f}%)")
         print(f"    Std deviation:        {np.std(accs):.4f}")
 
-        # Classification report (all folds)
         yt = np.concatenate(y_trues)
         yp = np.concatenate(y_preds)
         print(f"\n    Classification Report:")
@@ -317,16 +300,19 @@ def main():
             if line.strip():
                 print(f"    {line}")
 
-        # Train final per-move model on ALL data for this move
+        # Train final model with per-move complexity control
         clf = RandomForestClassifier(
-            n_estimators=200, random_state=42, n_jobs=-1,
+            n_estimators=n_est,
+            max_depth=max_d,
+            random_state=42,
+            n_jobs=-1,
         )
         clf.fit(X_move, y_move_sev)
         save_model(clf, f'quality_{move}.pkl')
 
-        # Compute Normal averages (for error localization feedback)
+        # Normal averages
         mask_normal = df_move['severity_label'] == 'Normal'
-        means = df_move.loc[mask_normal, feature_cols].mean().to_dict()
+        means = df_move.loc[mask_normal, move_feature_cols].mean().to_dict()
         normal_averages[move] = {k: round(v, 6) for k, v in means.items()}
         print()
 
@@ -352,7 +338,6 @@ def main():
             path = os.path.join(MODEL_DIR, f'{prefix}_{move}.pkl')
             if os.path.exists(path):
                 print(f"  models/{prefix}_{move}.pkl")
-    print(f"  models/quality_classifier.pkl  (global, kept for compatibility)")
     if normal_averages:
         print(f"  models/normal_averages.json")
     print()
